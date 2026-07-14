@@ -1,0 +1,28 @@
+[package]
+name = "bluesdp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Pure-Rust Bluetooth SDP client (no libbluetooth) for resolving RFCOMM channels via 16-bit service UUIDs"
+repository = "https://github.com/gnufood/bluesdp"
+keywords = ["bluetooth", "sdp", "rfcomm", "l2cap"]
+categories = ["hardware-support", "network-programming"]
+
+[dependencies]
+nom = "8"
+bytes = "1"
+bluer = { version = "0.17", features = ["l2cap"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
