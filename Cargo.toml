@@ -6,6 +6,7 @@ rust-version = "1.85"
 license = "MIT"
 description = "Pure-Rust Bluetooth SDP client (no libbluetooth) for resolving RFCOMM channels via 16-bit service UUIDs"
 repository = "https://github.com/gnufood/bluesdp"
+readme = "README.md"
 keywords = ["bluetooth", "sdp", "rfcomm", "l2cap"]
 categories = ["hardware-support", "network-programming"]
 
