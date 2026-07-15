@@ -8,8 +8,8 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::codec::{
-    decode_attribute_lists, encode, raw_response, reassemble, rfcomm_channel,
-    EncodeError, Page, ServiceSearchAttributeRequest,
+    decode_attribute_lists, encode, raw_response, rfcomm_channel,
+    EncodeError, ServiceSearchAttributeRequest,
 };
 
 use super::socket::{send_and_receive_pdu, SocketError};
@@ -62,6 +62,11 @@ where
 /// stream: send the initial request, drive continuation pages to
 /// completion, decode the reassembled attribute lists, and return the
 /// RFCOMM channel from the first matching service record, if any.
+///
+/// Pagination is inlined, not injected via callback: a callback capturing
+/// `stream`/`transaction_id` mutably can't satisfy `Send` under the
+/// higher-ranked bound a generic `fetch_next` would need, and this loop
+/// only ever has one caller.
 pub async fn find_rfcomm_channel<S>(
     stream: &mut S,
     service_uuid16: u16,
@@ -73,38 +78,16 @@ where
 
     let first_bytes = query_once(stream, transaction_id, service_uuid16, Vec::new()).await?;
     let (_, first_raw) = raw_response(&first_bytes).map_err(|_| QueryError::Decode)?;
-    let first_page: Page = first_raw.into();
 
-    // Threaded out here since fetch_next must return Page, not Result<Page, _>.
-    let mut last_error: Option<QueryError> = None;
+    let mut attribute_bytes = first_raw.attribute_bytes;
+    let mut continuation_state = first_raw.continuation_state;
 
-    let attribute_bytes = reassemble(first_page, async |continuation_state| {
+    while !continuation_state.is_empty() {
         transaction_id = transaction_id.wrapping_add(1);
-        let continuation_state = continuation_state.to_vec();
-
-        let outcome = async {
-            let bytes =
-                query_once(stream, transaction_id, service_uuid16, continuation_state).await?;
-            let (_, raw) = raw_response(&bytes).map_err(|_| QueryError::Decode)?;
-            Ok::<Page, QueryError>(raw.into())
-        }
-        .await;
-
-        match outcome {
-            Ok(page) => page,
-            Err(e) => {
-                last_error = Some(e);
-                Page {
-                    attribute_bytes: Vec::new(),
-                    continuation_state: Vec::new(),
-                }
-            }
-        }
-    })
-    .await;
-
-    if let Some(error) = last_error {
-        return Err(error);
+        let bytes = query_once(stream, transaction_id, service_uuid16, continuation_state).await?;
+        let (_, raw) = raw_response(&bytes).map_err(|_| QueryError::Decode)?;
+        attribute_bytes.extend_from_slice(&raw.attribute_bytes);
+        continuation_state = raw.continuation_state;
     }
 
     let (_, attribute_lists) =
@@ -248,6 +231,126 @@ mod tests {
         // carry an RFCOMM channel (2, 1, 1, 13, 8 respectively); record 2
         // (channel 2) is first in capture order, not PBAP (record 9).
         assert_eq!(channel, Some(2));
+        Ok(())
+    }
+
+    // Located by content, not a hardcoded offset, so this survives if earlier
+    // fields in the request change shape.
+    fn continuation_state_from_request_body(body: &[u8]) -> Option<Vec<u8>> {
+        let attribute_id_list_marker = [0x35, 0x05, 0x0a];
+        let marker_pos = body
+            .windows(attribute_id_list_marker.len())
+            .position(|w| w == attribute_id_list_marker)?;
+        let after_attribute_id_list = marker_pos + attribute_id_list_marker.len() + 4;
+        let &len = body.get(after_attribute_id_list)?;
+        if len == 0 {
+            return None;
+        }
+        body.get(after_attribute_id_list + 1..).map(<[u8]>::to_vec)
+    }
+
+    const EXPECTED_CONTINUATION_REQUESTS: [&[u8]; 7] = [
+        &[0x00, 0xf3],
+        &[0x01, 0xe9],
+        &[0x02, 0xdf],
+        &[0x03, 0xd5],
+        &[0x04, 0xcb],
+        &[0x05, 0xbf],
+        &[0x06, 0xb5],
+    ];
+
+    #[tokio::test]
+    async fn drives_all_eight_pages_and_requests_correct_continuation_each_time(
+    ) -> Result<(), String> {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let pages: Vec<Vec<u8>> = (0..8)
+            .map(|i| {
+                let fixture = match i {
+                    0 => include_str!("../../tests/fixtures/browse_page0_response.hex"),
+                    1 => include_str!("../../tests/fixtures/browse_page1_response.hex"),
+                    2 => include_str!("../../tests/fixtures/browse_page2_response.hex"),
+                    3 => include_str!("../../tests/fixtures/browse_page3_response.hex"),
+                    4 => include_str!("../../tests/fixtures/browse_page4_response.hex"),
+                    5 => include_str!("../../tests/fixtures/browse_page5_response.hex"),
+                    6 => include_str!("../../tests/fixtures/browse_page6_response.hex"),
+                    _ => include_str!("../../tests/fixtures/browse_page7_response.hex"),
+                };
+                hex_decode(fixture)
+            })
+            .collect();
+
+        let server_task = tokio::spawn(async move {
+            let mut seen_continuations = Vec::new();
+            for page in pages {
+                let mut header = [0u8; 5];
+                server
+                    .read_exact(&mut header)
+                    .await
+                    .map_err(|e| format!("server header read failed: {e}"))?;
+                let [_, _, _, len_hi, len_lo] = header;
+                let param_len = usize::from(u16::from_be_bytes([len_hi, len_lo]));
+                let mut body = vec![0u8; param_len];
+                server
+                    .read_exact(&mut body)
+                    .await
+                    .map_err(|e| format!("server body read failed: {e}"))?;
+
+                if let Some(blob) = continuation_state_from_request_body(&body) {
+                    seen_continuations.push(blob);
+                }
+
+                server
+                    .write_all(&page)
+                    .await
+                    .map_err(|e| format!("server write failed: {e}"))?;
+            }
+            Ok::<Vec<Vec<u8>>, String>(seen_continuations)
+        });
+
+        let channel = find_rfcomm_channel(&mut client, 0x1002)
+            .await
+            .map_err(|e| format!("find_rfcomm_channel failed: {e}"))?;
+
+        let seen_continuations = server_task
+            .await
+            .map_err(|e| format!("server task panicked: {e}"))??;
+
+        assert_eq!(seen_continuations, EXPECTED_CONTINUATION_REQUESTS);
+        assert_eq!(channel, Some(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_page_response_makes_exactly_one_request() -> Result<(), String> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let response = hex_decode(include_str!("../../tests/fixtures/pbap_response.hex"));
+
+        let server_task = tokio::spawn(async move {
+            let mut request_count = 0usize;
+            let mut request = vec![0u8; 20];
+            server
+                .read_exact(&mut request)
+                .await
+                .map_err(|e| format!("server read failed: {e}"))?;
+            request_count += 1;
+            server
+                .write_all(&response)
+                .await
+                .map_err(|e| format!("server write failed: {e}"))?;
+            Ok::<usize, String>(request_count)
+        });
+
+        let channel = find_rfcomm_channel(&mut client, 0x112f)
+            .await
+            .map_err(|e| format!("find_rfcomm_channel failed: {e}"))?;
+
+        let request_count = server_task
+            .await
+            .map_err(|e| format!("server task panicked: {e}"))??;
+
+        assert_eq!(request_count, 1, "must not fetch a continuation page when there is none");
+        assert_eq!(channel, Some(13));
         Ok(())
     }
 }
